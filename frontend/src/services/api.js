@@ -29,7 +29,7 @@ apiClient.interceptors.response.use(
       config._retried = true;
       retryQueue.push(() => apiClient.request(config));
     }
-    return Promise.reject(error);
+    return Promise.reject(normalizeError(error));
   }
 );
 
@@ -41,7 +41,87 @@ export function retryQueuedRequests() {
   }
 }
 
+function normalizeError(error) {
+  if (error?.response?.data?.error) {
+    const e = error.response.data.error;
+    return { status: error.response.status, message: e.message, code: e.code, fields: e.fields };
+  }
+  return { status: error?.response?.status || 0, message: error.message || 'Network error' };
+}
+
 export const api = {
+  async getMe() {
+    const res = await apiClient.get('/users/me');
+    return res.data;
+  },
+  async login(email, password) {
+    const res = await apiClient.post('/auth/login', { email, password });
+    return res.data;
+  },
+  async login2FA(data) {
+    const res = await apiClient.post('/auth/2fa/challenge', data);
+    return res.data;
+  },
+  async register(data) {
+    const res = await apiClient.post('/auth/register', data);
+    return res.data;
+  },
+  async logout() {
+    const res = await apiClient.post('/auth/logout');
+    return res.data;
+  },
+  async forgotPassword(data) {
+    const res = await apiClient.post('/auth/forgot-password', data);
+    return res.data;
+  },
+  async resetPassword(data) {
+    const res = await apiClient.post('/auth/reset-password', data);
+    return res.data;
+  },
+  async adminExitImpersonation() {
+    const res = await apiClient.post('/admin/impersonate/exit');
+    return res.data;
+  },
+  async adminImpersonateUser(userId) {
+    const res = await apiClient.post(`/admin/impersonate/${userId}`);
+    return res.data;
+  },
+  async adminSuspendCampaign(id, data) {
+    const res = await apiClient.patch(`/admin/campaigns/${id}/suspend`, data);
+    return res.data;
+  },
+  async getContributions(campaignId, params) {
+    const res = await apiClient.get(`/campaigns/${campaignId}/backers`, { params });
+    return res.data;
+  },
+  async getCampaignRequirements(campaignId) {
+    const res = await apiClient.get(`/campaigns/${campaignId}/requirements`);
+    return res.data;
+  },
+  async setCampaignRequirements(campaignId, data) {
+    const res = await apiClient.post(`/campaigns/${campaignId}/requirements`, data);
+    return res.data;
+  },
+  async approveMilestone(id) {
+    const res = await apiClient.post(`/milestones/${id}/approve`);
+    return res.data;
+  },
+  async rejectMilestone(id, data) {
+    const res = await apiClient.post(`/milestones/${id}/reject`, data);
+    return res.data;
+  },
+  async voteMilestone(id, data) {
+    const res = await apiClient.post(`/milestones/${id}/votes`, data);
+    return res.data;
+  },
+  async submitMilestoneEvidence(id, formData) {
+    const res = await apiClient.post(`/milestones/${id}/upload-evidence`, formData);
+    return res.data;
+  },
+  async getMilestones(campaignId) {
+    const res = await apiClient.get(`/milestones/campaign/${campaignId}`);
+    return res.data;
+  },
   async getPlatformConfig() {
     const res = await apiClient.get('/governance/fee');
     return res.data;

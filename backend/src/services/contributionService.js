@@ -1,4 +1,8 @@
-const { insertContributionSubmitted } = require('./stellarTransactionService');
+const {
+  insertContributionPending,
+  markContributionSubmitted,
+  markContributionFailed,
+} = require('./stellarTransactionService');
 const { withDecryptedWalletSecret } = require('./walletSecrets');
 const {
   prepareSignedContributionPayment,
@@ -105,6 +109,7 @@ async function submitCustodialContribution({
   deviceFingerprint,
   client,
   tierId,
+  idempotencyKey,
 }) {
   const contractMode = isContractDepositEligible(campaign);
   if (contractMode && sendAsset !== campaign.asset_type) {
@@ -122,76 +127,6 @@ async function submitCustodialContribution({
       contributorPublicKey: walletPublicKey,
       displayName,
     }));
-
-  let unsignedXdr = null;
-  let signedXdr = null;
-  let txHash;
-
-  if (contractMode) {
-    // Same-asset only (see issue #710) — deposit directly into the escrow
-    // contract, self-authorized by the custodial account's own key, instead
-    // of paying the classic campaign wallet.
-    const depositResult = await withDecryptedWalletSecret(
-      walletSecretEncrypted,
-      { userId, walletPublicKey },
-      async (senderSecret) => {
-        await ensureCustodialAccountFundedAndTrusted({
-          publicKey: walletPublicKey,
-          secret: senderSecret,
-        });
-        return depositToEscrow({
-          contractId: campaign.escrow_contract_id,
-          fromAddress: walletPublicKey,
-          amount: Math.floor(parseFloat(amount) * STELLAR_ASSET_DECIMALS_SCALE),
-          signerSecret: senderSecret,
-        });
-      }
-    );
-    txHash = depositResult.txHash;
-  } else {
-    const preparedTransaction = await withDecryptedWalletSecret(
-      walletSecretEncrypted,
-      {
-        userId,
-        walletPublicKey,
-      },
-      async (senderSecret) => {
-        await ensureCustodialAccountFundedAndTrusted({
-          publicKey: walletPublicKey,
-          secret: senderSecret,
-        });
-
-        if (intent.kind === 'payment') {
-          return prepareSignedContributionPayment({
-            senderSecret,
-            destinationPublicKey: campaign.wallet_public_key,
-            asset: sendAsset,
-            amount,
-            memo: buildAttributionMemo(campaignId, referralLinkCode),
-          });
-        }
-
-        return prepareSignedContributionPathPayment({
-          senderSecret,
-          destinationPublicKey: campaign.wallet_public_key,
-          sendAsset,
-          sendMax: intent.sendMax,
-          destAmount: amount,
-          destAssetCode: campaign.asset_type,
-          memo: buildAttributionMemo(campaignId, referralLinkCode),
-        });
-      }
-    );
-
-    unsignedXdr = preparedTransaction.unsignedXdr;
-    signedXdr = preparedTransaction.signedXdr;
-    try {
-      txHash = await submitPreparedTransaction(signedXdr);
-    } catch (err) {
-      err.statusCode = err.statusCode || 502;
-      throw err;
-    }
-  }
 
   const metadata = {
     ...intent.flowMetadata,
@@ -215,18 +150,116 @@ async function submitCustodialContribution({
       : {}),
   };
 
-  const stellarTransactionId = await insertContributionSubmitted(client, {
-    txHash,
+  // Record the DB intent BEFORE any Stellar submission happens (#810): this
+  // makes the operation atomic in the sense that a durable row always exists
+  // first, and idempotent — a retry with the same idempotencyKey (e.g. after
+  // a client timeout) reuses the existing row/result instead of paying twice.
+  const pendingRow = await insertContributionPending(client, {
+    idempotencyKey: idempotencyKey || null,
     campaignId,
     userId,
-    unsignedXdr,
-    signedXdr,
+    unsignedXdr: null,
+    signedXdr: null,
     metadata,
   });
 
+  if (pendingRow.reused) {
+    return {
+      txHash: pendingRow.txHash,
+      stellarTransactionId: pendingRow.id,
+      unsignedXdr: null,
+      signedXdr: null,
+      conversionQuote: intent.conversionQuote,
+      flowMetadata: metadata,
+      contractMode,
+      destinationAmount: parseFloat(amount),
+      destinationAsset: campaign.asset_type,
+      replayed: true,
+    };
+  }
+
+  const pendingRowId = pendingRow.id;
+  let unsignedXdr = null;
+  let signedXdr = null;
+  let txHash;
+
+  try {
+    if (contractMode) {
+      // Same-asset only (see issue #710) — deposit directly into the escrow
+      // contract, self-authorized by the custodial account's own key, instead
+      // of paying the classic campaign wallet.
+      const depositResult = await withDecryptedWalletSecret(
+        walletSecretEncrypted,
+        { userId, walletPublicKey },
+        async (senderSecret) => {
+          await ensureCustodialAccountFundedAndTrusted({
+            publicKey: walletPublicKey,
+            secret: senderSecret,
+          });
+          return depositToEscrow({
+            contractId: campaign.escrow_contract_id,
+            fromAddress: walletPublicKey,
+            amount: Math.floor(parseFloat(amount) * STELLAR_ASSET_DECIMALS_SCALE),
+            signerSecret: senderSecret,
+          });
+        }
+      );
+      txHash = depositResult.txHash;
+    } else {
+      const preparedTransaction = await withDecryptedWalletSecret(
+        walletSecretEncrypted,
+        {
+          userId,
+          walletPublicKey,
+        },
+        async (senderSecret) => {
+          await ensureCustodialAccountFundedAndTrusted({
+            publicKey: walletPublicKey,
+            secret: senderSecret,
+          });
+
+          if (intent.kind === 'payment') {
+            return prepareSignedContributionPayment({
+              senderSecret,
+              destinationPublicKey: campaign.wallet_public_key,
+              asset: sendAsset,
+              amount,
+              memo: buildAttributionMemo(campaignId, referralLinkCode),
+            });
+          }
+
+          return prepareSignedContributionPathPayment({
+            senderSecret,
+            destinationPublicKey: campaign.wallet_public_key,
+            sendAsset,
+            sendMax: intent.sendMax,
+            destAmount: amount,
+            destAssetCode: campaign.asset_type,
+            memo: buildAttributionMemo(campaignId, referralLinkCode),
+          });
+        }
+      );
+
+      unsignedXdr = preparedTransaction.unsignedXdr;
+      signedXdr = preparedTransaction.signedXdr;
+
+      try {
+        txHash = await submitPreparedTransaction(signedXdr);
+      } catch (err) {
+        err.statusCode = err.statusCode || 502;
+        throw err;
+      }
+    }
+  } catch (err) {
+    await markContributionFailed(client, pendingRowId, err.message);
+    throw err;
+  }
+
+  await markContributionSubmitted(client, pendingRowId, txHash);
+
   return {
     txHash,
-    stellarTransactionId,
+    stellarTransactionId: pendingRowId,
     unsignedXdr,
     signedXdr,
     conversionQuote: intent.conversionQuote,

@@ -150,6 +150,31 @@ async function fundCustodialAccountFromPlatformIfNeeded(publicKey) {
 }
 
 /**
+ * Top up an existing campaign wallet's native XLM reserve from the platform
+ * account. Used by ops wallet-audit approve-funding (#811).
+ */
+async function submitWalletTopUpPayment({ destinationPublicKey, amountXlm }) {
+  const platformAccount = await server.loadAccount(getPlatformKeypair().publicKey());
+  const tx = new TransactionBuilder(platformAccount, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(
+      Operation.payment({
+        destination: destinationPublicKey,
+        asset: Asset.native(),
+        amount: String(amountXlm),
+      })
+    )
+    .setTimeout(TX_TIMEOUT_CONTRIBUTION_S)
+    .build();
+
+  tx.sign(getPlatformKeypair());
+  const result = await server.submitTransaction(tx);
+  return result.hash;
+}
+
+/**
  * Add missing trustlines for all configured credit assets; signed by the custodial account master.
  * Returns the last transaction hash if a transaction was submitted, otherwise null.
  */
@@ -1339,6 +1364,7 @@ module.exports = {
   listCreditAssetCodes,
   ensureCustodialAccountFundedAndTrusted,
   fundCustodialAccountFromPlatformIfNeeded,
+  submitWalletTopUpPayment,
   submitMissingTrustlinesForCustodialAccount,
   buildUnsignedContributionPayment,
   buildUnsignedContributionPathPayment,

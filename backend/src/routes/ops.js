@@ -15,6 +15,7 @@ const {
   auditCampaignWallets,
 } = require('../services/ops/healthCollector');
 const { executeRunbook } = require('../services/ops/runbooks');
+const { submitWalletTopUpPayment } = require('../services/stellarService');
 
 /**
  * Middleware to require and validate OPS_API_KEY.
@@ -245,7 +246,7 @@ router.post('/campaigns/wallet-audit/:campaignId/approve-funding', async (req, r
   try {
     const { campaignId } = req.params;
     const audit = await auditCampaignWallets();
-    const target = audit.wallets.find((w) => w.campaign_id === campaignId);
+    const target = audit.wallets.find((w) => String(w.campaign_id) === String(campaignId));
 
     if (!target) {
       return res.status(404).json({
@@ -253,16 +254,63 @@ router.post('/campaigns/wallet-audit/:campaignId/approve-funding', async (req, r
       });
     }
 
+    if (target.deficit_xlm <= 0) {
+      return res.status(400).json({
+        error: { code: 'NO_DEFICIT', message: 'Campaign wallet has no funding deficit' },
+      });
+    }
+
+    // Idempotency: the partial unique index on (campaign_id) WHERE status IN
+    // (pending, submitted) rejects a second concurrent/duplicate approval
+    // for the same campaign while one is already in flight.
+    let approvalId;
+    try {
+      const { rows } = await db.query(
+        `INSERT INTO wallet_funding_approvals (campaign_id, wallet_public_key, deficit_xlm, status)
+         VALUES ($1, $2, $3, 'pending')
+         RETURNING id`,
+        [campaignId, target.wallet_public_key, target.deficit_xlm]
+      );
+      approvalId = rows[0].id;
+    } catch (err) {
+      if (err.code === '23505') {
+        return res.status(409).json({
+          error: { code: 'ALREADY_IN_FLIGHT', message: 'A funding approval for this campaign is already in progress' },
+        });
+      }
+      throw err;
+    }
+
+    let txHash;
+    try {
+      txHash = await submitWalletTopUpPayment({
+        destinationPublicKey: target.wallet_public_key,
+        amountXlm: target.deficit_xlm,
+      });
+      await db.query(
+        `UPDATE wallet_funding_approvals SET status = 'confirmed', tx_hash = $1, updated_at = NOW() WHERE id = $2`,
+        [txHash, approvalId]
+      );
+    } catch (err) {
+      await db.query(
+        `UPDATE wallet_funding_approvals SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
+        [err.message, approvalId]
+      );
+      throw err;
+    }
+
     logger.info('Operator approved funding for campaign wallet', {
       campaign_id: campaignId,
       deficit_xlm: target.deficit_xlm,
+      tx_hash: txHash,
     });
 
     res.json({
-      status: 'approved',
+      status: 'confirmed',
       campaign_id: campaignId,
       deficit_xlm: target.deficit_xlm,
-      message: `Funding approval recorded for ${target.campaign_title}. Deficit: ${target.deficit_xlm} XLM.`,
+      tx_hash: txHash,
+      message: `Funding approval submitted for ${target.campaign_title}. Deficit: ${target.deficit_xlm} XLM.`,
     });
   } catch (err) {
     next(err);

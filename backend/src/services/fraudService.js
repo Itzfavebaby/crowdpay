@@ -144,11 +144,68 @@ async function getFraudDashboard({ status, limit = 50, offset = 0 }) {
 }
 
 /**
- * Retrain model placeholder / statistics hook
+ * Retrain / re-validate the fraud model.
+ *
+ * There is no ML training pipeline in this codebase yet — "retrain" here
+ * means recomputing validation metrics from real admin review outcomes
+ * (contribution_fraud_scores rows an admin has resolved as 'approved' vs
+ * 'rejected' after being held for review) and persisting a new versioned
+ * snapshot, instead of returning hardcoded numbers (#808). If there isn't
+ * enough resolved data yet to compute a meaningful rate, that is reported
+ * explicitly rather than papered over with a fake metric.
  */
 async function retrainModel() {
-  logger.info('Fraud detection model retrained successfully with latest validation dataset.');
-  return { success: true, falsePositiveRate: '1.2%', validationSamples: 12500 };
+  const { rows: statsRows } = await db.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('approved', 'rejected'))::int AS resolved_count,
+       COUNT(*) FILTER (WHERE status = 'approved')::int AS false_positive_count
+     FROM contribution_fraud_scores`
+  );
+  const { resolved_count: resolvedCount, false_positive_count: falsePositiveCount } = statsRows[0];
+
+  const { rows: versionRows } = await db.query(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next_version FROM fraud_model_versions`
+  );
+  const nextVersion = versionRows[0].next_version;
+
+  if (resolvedCount === 0) {
+    const { rows } = await db.query(
+      `INSERT INTO fraud_model_versions (version, status, false_positive_rate, validation_samples, notes)
+       VALUES ($1, 'insufficient_data', NULL, 0, 'No resolved fraud reviews yet to compute a false positive rate')
+       RETURNING *`,
+      [nextVersion]
+    );
+    logger.warn('Fraud model retrain skipped scoring: no resolved review data yet', { version: nextVersion });
+    return {
+      success: false,
+      version: rows[0].version,
+      status: rows[0].status,
+      message: rows[0].notes,
+      validationSamples: 0,
+    };
+  }
+
+  const falsePositiveRate = falsePositiveCount / resolvedCount;
+  const { rows } = await db.query(
+    `INSERT INTO fraud_model_versions (version, status, false_positive_rate, validation_samples)
+     VALUES ($1, 'completed', $2, $3)
+     RETURNING *`,
+    [nextVersion, falsePositiveRate, resolvedCount]
+  );
+
+  logger.info('Fraud detection model revalidated from real review outcomes', {
+    version: rows[0].version,
+    false_positive_rate: falsePositiveRate,
+    validation_samples: resolvedCount,
+  });
+
+  return {
+    success: true,
+    version: rows[0].version,
+    status: rows[0].status,
+    falsePositiveRate,
+    validationSamples: resolvedCount,
+  };
 }
 
 /**

@@ -44,7 +44,7 @@ router.post(
   contributionValidation,
   validateRequest,
   asyncHandler(async (req, res) => {
-    const { campaign_id, amount, send_asset, tier_id, display_name } = req.body;
+    const { campaign_id, amount, send_asset, tier_id, display_name, idempotency_key } = req.body;
     const userId = req.user.userId;
 
     await assertUserKycVerified(userId);
@@ -69,24 +69,43 @@ router.post(
       referralLink = await resolveReferralLink({ campaignId: campaign_id, code: referralCode });
     }
 
-    if (tier_id) {
-      await reserveTierSlot({ tierId: tier_id, userId });
-    }
+    const client = await db.connect();
+    let result;
+    try {
+      await client.query('BEGIN');
 
-    const result = await contributionService.submitCustodialContribution({
-      campaign,
-      campaignId: campaign_id,
-      userId,
-      walletPublicKey,
-      walletSecretEncrypted,
-      amount,
-      sendAsset: send_asset || campaign.asset_type,
-      displayName: display_name,
-      referralCode,
-      referralLinkCode: referralLink?.code,
-      referralLinkId: referralLink?.id,
-      tierId: tier_id,
-    });
+      if (tier_id) {
+        const reserved = await reserveTierSlot(client, { tierId: tier_id, campaignId: campaign_id });
+        if (!reserved) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ error: 'Reward tier is no longer available' });
+        }
+      }
+
+      result = await contributionService.submitCustodialContribution({
+        campaign,
+        campaignId: campaign_id,
+        userId,
+        walletPublicKey,
+        walletSecretEncrypted,
+        amount,
+        sendAsset: send_asset || campaign.asset_type,
+        displayName: display_name,
+        referralCode,
+        referralLinkCode: referralLink?.code,
+        referralLinkId: referralLink?.id,
+        tierId: tier_id,
+        idempotencyKey: idempotency_key,
+        client,
+      });
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     return res.status(202).json({
       success: true,

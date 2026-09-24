@@ -25,10 +25,12 @@ function buildService({ sorobanImpl, stellarImpl, stellarTxImpl } = {}) {
   };
 
   const stellarTxStub = {
-    insertContributionSubmitted: async (_client, row) => {
+    insertContributionPending: async (_client, row) => {
       insertCalls.push(row);
-      return 'stellar-row-id';
+      return { id: 'stellar-row-id', reused: false };
     },
+    markContributionSubmitted: async () => {},
+    markContributionFailed: async () => {},
     ...stellarTxImpl,
   };
 
