@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { sendEmail } = require('./emailService');
-const { isSafeUrl } = require('../utils/ssrfGuard');
+const { safeFetch } = require('../utils/safeFetch');
 
 const WEBHOOK_EVENTS = {
   CAMPAIGN_FUNDED: 'campaign.funded',
@@ -123,19 +123,10 @@ async function processDelivery(deliveryId) {
   let res;
   let responseText = '';
   try {
-    // Defense-in-depth: re-validate URL at dispatch time to prevent
-    // DNS rebinding attacks where a domain resolves to a safe IP at
-    // creation time but is later changed to point to a private network.
-    const urlCheck = await isSafeUrl(row.url);
-    if (!urlCheck.safe) {
-      await db.query(
-        `UPDATE webhook_deliveries SET status = 'failed', last_error = $2, updated_at = NOW() WHERE id = $1`,
-        [deliveryId, `SSRF guard: ${urlCheck.reason}`]
-      );
-      return;
-    }
-
-    res = await fetch(row.url, {
+    // Re-validates and pins the connection target on every hop (including
+    // redirects), so neither DNS rebinding between validation and connection
+    // nor a redirect to a private/internal target can bypass the guard.
+    res = await safeFetch(row.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -144,10 +135,17 @@ async function processDelivery(deliveryId) {
         'X-CrowdPay-Delivery-Id': deliveryId,
       },
       body: bodyUtf8,
-      signal: AbortSignal.timeout(9000),
+      timeoutMs: 9000,
     });
     responseText = await res.text();
   } catch (err) {
+    if (err.isSsrfBlocked) {
+      await db.query(
+        `UPDATE webhook_deliveries SET status = 'failed', last_error = $2, updated_at = NOW() WHERE id = $1`,
+        [deliveryId, err.message]
+      );
+      return;
+    }
     await scheduleRetry(deliveryId, nextAttempt, err.message || String(err), null, null, row.backoff_strategy);
     return;
   }
@@ -304,19 +302,10 @@ async function processCampaignWebhookDelivery(deliveryId) {
 
   let res;
   try {
-    // Defense-in-depth: re-validate URL at dispatch time to prevent
-    // DNS rebinding attacks where a domain resolves to a safe IP at
-    // creation time but is later changed to point to a private network.
-    const urlCheck = await isSafeUrl(row.url);
-    if (!urlCheck.safe) {
-      await db.query(
-        `UPDATE campaign_webhook_deliveries SET status = 'failed', last_error = $2, failed_at = NOW(), updated_at = NOW() WHERE id = $1`,
-        [deliveryId, `SSRF guard: ${urlCheck.reason}`]
-      );
-      return;
-    }
-
-    res = await fetch(row.url, {
+    // Re-validates and pins the connection target on every hop (including
+    // redirects), so neither DNS rebinding between validation and connection
+    // nor a redirect to a private/internal target can bypass the guard.
+    res = await safeFetch(row.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -325,9 +314,16 @@ async function processCampaignWebhookDelivery(deliveryId) {
         'X-CrowdPay-Delivery-Id': deliveryId,
       },
       body: bodyUtf8,
-      signal: AbortSignal.timeout(9000),
+      timeoutMs: 9000,
     });
   } catch (err) {
+    if (err.isSsrfBlocked) {
+      await db.query(
+        `UPDATE campaign_webhook_deliveries SET status = 'failed', last_error = $2, failed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [deliveryId, err.message]
+      );
+      return;
+    }
     await scheduleCampaignWebhookRetry(
       deliveryId,
       nextAttempt,

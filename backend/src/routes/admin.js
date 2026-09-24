@@ -30,7 +30,11 @@ router.post('/impersonate/exit', requireAuth, asyncHandler(async (req, res) => {
     [req.impersonation.adminUserId, 'impersonate_end', 'user', req.impersonation.targetUserId]
   );
 
-  res.clearCookie(IMPERSONATION_TOKEN_COOKIE_NAME);
+  res.clearCookie(IMPERSONATION_TOKEN_COOKIE_NAME, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+  });
 
   res.json({ success: true });
 }));
@@ -487,6 +491,9 @@ router.post('/impersonate/:userId', asyncHandler(async (req, res) => {
 
   const token = jwt.sign(
     {
+      sub: targetUser.id.toString(),
+      iss: 'https://crowdpay.io',
+      aud: 'crowdpay-api',
       userId: targetUser.id,
       impersonated_by: req.user.userId,
       impersonation: true,

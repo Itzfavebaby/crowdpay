@@ -91,6 +91,42 @@ function buildApp({
   return app;
 }
 
+function buildRealAuthMiddleware(dbQueryImpl) {
+  return proxyquire('../middleware/auth', {
+    '../config/database': { query: dbQueryImpl },
+    '@sentry/node': { setUser: () => {} },
+    '../services/apiKeyService': { authenticateCpkApiKey: async () => null },
+  });
+}
+
+function mockRes() {
+  return {
+    statusCode: 0,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+}
+
+/** Runs requireAuth and resolves whether it calls next() or short-circuits via res.json(). */
+function runRequireAuth(requireAuth, req) {
+  const res = mockRes();
+  return new Promise((resolve) => {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+      originalJson(body);
+      resolve(res);
+    };
+    requireAuth(req, res, () => resolve(res));
+  });
+}
+
 async function withServer(app, fn) {
   const server = app.listen(0);
   const { port } = server.address();
@@ -114,6 +150,9 @@ test('POST /api/admin/impersonate/:userId returns a 15-minute impersonation toke
     assert.equal(decoded.userId, targetUser.id);
     assert.equal(decoded.impersonated_by, 'admin-1');
     assert.equal(decoded.impersonation, true);
+    assert.equal(decoded.sub, targetUser.id.toString());
+    assert.equal(decoded.iss, 'https://crowdpay.io');
+    assert.equal(decoded.aud, 'crowdpay-api');
     assert.ok(decoded.exp - decoded.iat <= 900);
 
     assert.equal(body.expires_in, 900);
@@ -148,4 +187,60 @@ test('POST /api/admin/impersonate/exit clears cookie and logs the end event', as
     assert.equal(auditCall.params[0], 'admin-1');
     assert.equal(auditCall.params[3], targetUser.id);
   });
+});
+
+test('an impersonation token issued by admin.js authenticates against the real middleware, is scoped, and is audited', async () => {
+  // Mint the token through the real route handler (not a hand-rolled jwt.sign call),
+  // so this test would have caught the missing sub/iss/aud regression.
+  const mintedToken = await withServer(buildApp(), async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/api/admin/impersonate/${targetUser.id}`, { method: 'POST' });
+    const body = await res.json();
+    return body.token;
+  });
+
+  const authQueryCalls = [];
+  const authDbQuery = async (text, params = []) => {
+    authQueryCalls.push({ text, params });
+    if (text.includes('SELECT role, is_admin, is_banned FROM users')) {
+      return { rows: [{ role: targetUser.role, is_admin: false, is_banned: false }] };
+    }
+    return { rows: [] };
+  };
+  const { requireAuth } = buildRealAuthMiddleware(authDbQuery);
+
+  // A normal read is allowed and correctly identifies the impersonated session.
+  const readReq = {
+    cookies: { cp_impersonation_token: mintedToken },
+    headers: {},
+    method: 'GET',
+    originalUrl: '/api/campaigns',
+  };
+  const readRes = await runRequireAuth(requireAuth, readReq);
+
+  assert.equal(readRes.statusCode, 0, 'requireAuth must call next(), not respond, for an allowed GET');
+  assert.equal(readReq.user.userId, targetUser.id);
+  assert.equal(readReq.user.is_admin, false, 'admin rights are stripped while impersonating');
+  assert.deepEqual(readReq.impersonation, { adminUserId: 'admin-1', targetUserId: targetUser.id });
+
+  const auditCall2 = authQueryCalls.find((c) => c.params[1] === 'impersonated_request');
+  assert.ok(auditCall2, 'every impersonated request is audit-logged');
+  assert.equal(auditCall2.params[0], 'admin-1');
+  assert.equal(auditCall2.params[3], targetUser.id);
+
+  // A restricted action (write to a sensitive, wallet-signing-adjacent path) is blocked.
+  authQueryCalls.length = 0;
+  const writeReq = {
+    cookies: { cp_impersonation_token: mintedToken },
+    headers: {},
+    method: 'POST',
+    originalUrl: '/api/governance/proposals',
+  };
+  const writeRes = await runRequireAuth(requireAuth, writeReq);
+
+  assert.equal(writeRes.statusCode, 403);
+  assert.deepEqual(writeRes.body, { error: 'Impersonation mode cannot perform this action' });
+
+  // Retained 15-minute lifetime.
+  const decoded = jwt.decode(mintedToken);
+  assert.equal(decoded.exp - decoded.iat, 900);
 });

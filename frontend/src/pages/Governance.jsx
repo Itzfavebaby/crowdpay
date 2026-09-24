@@ -1,7 +1,50 @@
 import { useState, useEffect } from 'react';
+import { getNetwork, signTransaction } from '@stellar/freighter-api';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import Navbar from '../components/Navbar';
+
+/**
+ * Governance actions are always requested from the same endpoint regardless
+ * of wallet type — the server resolves the caller's wallet and either signs
+ * inline (custodial) or hands back { mode: 'prepare', unsigned_xdr,
+ * prepare_token } for a Freighter wallet to sign in the browser (#802).
+ * This helper completes the Freighter leg when needed and returns the final
+ * response body either way.
+ */
+async function completeGovernanceAction(prepareResponse, submitSignedUrl, token) {
+  if (prepareResponse.mode !== 'prepare') {
+    return prepareResponse;
+  }
+
+  const network = await getNetwork();
+  if (network?.error) throw new Error('Could not read Freighter network');
+
+  const signed = await signTransaction(prepareResponse.unsigned_xdr, {
+    networkPassphrase: network?.networkPassphrase,
+  });
+  if (signed?.error) throw new Error(signed.error?.message || 'Freighter signing failed');
+  if (!signed?.signedTxXdr) throw new Error('Freighter did not return a signed transaction');
+
+  const response = await fetch(submitSignedUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      prepare_token: prepareResponse.prepare_token,
+      signed_xdr: signed.signedTxXdr,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || 'Failed to submit signed transaction');
+  }
+
+  return response.json();
+}
 
 export default function Governance() {
   const { user } = useAuth();
@@ -18,7 +61,6 @@ export default function Governance() {
     new_fee_bps: '',
     new_creator_share_bps: '',
     rationale_text: '',
-    signer_secret: '',
   });
 
   useEffect(() => {
@@ -67,13 +109,14 @@ export default function Governance() {
 
   const handleCreateProposal = async (e) => {
     e.preventDefault();
-    
+    const token = localStorage.getItem('token');
+
     try {
       const response = await fetch('/api/governance/proposals', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify(newProposal),
       });
@@ -83,14 +126,14 @@ export default function Governance() {
         throw new Error(error.error || 'Failed to create proposal');
       }
 
-      const data = await response.json();
+      await completeGovernanceAction(await response.json(), '/api/governance/proposals/submit-signed', token);
+
       showToast('Proposal created successfully', 'success');
       setShowCreateForm(false);
       setNewProposal({
         new_fee_bps: '',
         new_creator_share_bps: '',
         rationale_text: '',
-        signer_secret: '',
       });
       loadGovernanceData();
     } catch (error) {
@@ -100,28 +143,30 @@ export default function Governance() {
 
   const handleVote = async (inFavor) => {
     if (!activeProposal || !user) return;
+    const token = localStorage.getItem('token');
 
     try {
       setVoting(true);
-      
-      // In production, this would use Freighter to sign the transaction
-      // For now, we'll use the signer secret (this should be replaced with proper wallet signing)
+
       const response = await fetch(`/api/governance/proposals/${activeProposal.id}/vote`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+          'Authorization': `Bearer ${token}`,
         },
-        body: JSON.stringify({
-          in_favor: inFavor,
-          signer_secret: newProposal.signer_secret, // This should come from wallet signing
-        }),
+        body: JSON.stringify({ in_favor: inFavor }),
       });
 
       if (!response.ok) {
         const error = await response.json();
         throw new Error(error.error || 'Failed to vote');
       }
+
+      await completeGovernanceAction(
+        await response.json(),
+        `/api/governance/proposals/${activeProposal.id}/vote/submit-signed`,
+        token
+      );
 
       showToast('Vote recorded successfully', 'success');
       loadGovernanceData();
@@ -142,9 +187,6 @@ export default function Governance() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
         },
-        body: JSON.stringify({
-          signer_secret: newProposal.signer_secret, // This should come from wallet signing
-        }),
       });
 
       if (!response.ok) {
@@ -412,23 +454,6 @@ export default function Governance() {
                       rows="3"
                       placeholder="Explain why this change is needed..."
                     />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Signer Secret (for transaction signing)
-                    </label>
-                    <input
-                      type="password"
-                      required
-                      value={newProposal.signer_secret}
-                      onChange={(e) => setNewProposal({ ...newProposal, signer_secret: e.target.value })}
-                      className="w-full border border-gray-300 rounded-lg px-3 py-2"
-                      placeholder="Your Stellar secret key"
-                    />
-                    <p className="text-xs text-gray-500 mt-1">
-                      In production, this would use Freighter wallet signing
-                    </p>
                   </div>
 
                   <div className="flex space-x-4">

@@ -182,7 +182,6 @@ export default function PoolManager({ campaignId, campaignTitle }) {
           {pools.map((pool) => {
             const isLeader = pool.leader_id === user.id;
             const canSubmit = isLeader && pool.status === 'open';
-            const isMember = pool.member_count > 0 && (isLeader || false); // simplified check
 
             return (
               <div key={pool.id} className="bg-white border rounded-lg p-4">

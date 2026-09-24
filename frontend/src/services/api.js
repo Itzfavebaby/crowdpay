@@ -193,4 +193,33 @@ export const api = {
     const res = await apiClient.post('/users/me/2fa/verify', { code });
     return res.data;
   },
+  async listCampaignPools(campaignId) {
+    const res = await apiClient.get(`/campaign-pools/campaign/${campaignId}`);
+    return res.data;
+  },
+  async createPool({ campaign_id, title, description, target_amount, expires_at }) {
+    const res = await apiClient.post('/campaign-pools', {
+      campaign_id,
+      title,
+      description,
+      target_amount,
+      expires_at,
+    });
+    return res.data;
+  },
+  async joinPool(poolId, shareAmount, displayName) {
+    const res = await apiClient.post(`/campaign-pools/${poolId}/join`, {
+      share_amount: shareAmount,
+      display_name: displayName,
+    });
+    return res.data;
+  },
+  async leavePool(poolId) {
+    const res = await apiClient.post(`/campaign-pools/${poolId}/leave`);
+    return res.data;
+  },
+  async submitPool(poolId) {
+    const res = await apiClient.post(`/campaign-pools/${poolId}/submit`);
+    return res.data;
+  },
 };

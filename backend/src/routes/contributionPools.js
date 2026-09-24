@@ -48,7 +48,7 @@ router.get(
   '/mine',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const pools = await poolQueries.listByUser(req.user.id);
+    const pools = await poolQueries.listByUser(req.user.userId);
     res.json({ success: true, data: pools });
   })
 );
@@ -72,7 +72,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const pool = await poolQueries.create({
       campaign_id: req.body.campaign_id,
-      leader_id: req.user.id,
+      leader_id: req.user.userId,
       title: req.body.title,
       description: req.body.description || null,
       target_amount: req.body.target_amount,
@@ -91,7 +91,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const membership = await poolQueries.join({
       pool_id: req.params.poolId,
-      user_id: req.user.id,
+      user_id: req.user.userId,
       share_amount: req.body.share_amount,
       display_name: req.body.display_name || null,
     });
@@ -104,7 +104,7 @@ router.post(
   '/:poolId/leave',
   requireAuth,
   asyncHandler(async (req, res) => {
-    await poolQueries.leave(req.params.poolId, req.user.id);
+    await poolQueries.leave(req.params.poolId, req.user.userId);
     res.json({ success: true });
   })
 );
@@ -116,7 +116,7 @@ router.patch(
   updatePoolValidation,
   validate,
   asyncHandler(async (req, res) => {
-    const pool = await poolQueries.update(req.params.poolId, req.user.id, req.body);
+    const pool = await poolQueries.update(req.params.poolId, req.user.userId, req.body);
     if (!pool) return res.status(403).json({ success: false, error: 'Not authorized or pool not found' });
     res.json({ success: true, data: pool });
   })
@@ -127,7 +127,7 @@ router.post(
   '/:poolId/submit',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const result = await poolQueries.submitPool(req.params.poolId, req.user.id);
+    const result = await poolQueries.submitPool(req.params.poolId, req.user.userId);
     res.json({ success: true, data: result });
   })
 );

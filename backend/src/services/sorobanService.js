@@ -73,6 +73,130 @@ async function invokeContract({ contractId, method, args, signerSecret }) {
   return returnValue;
 }
 
+/**
+ * Builds an unsigned, simulation-prepared invocation of an arbitrary contract
+ * method for the self-custody (Freighter) flow, where the server doesn't hold
+ * the caller's key and must hand back XDR for the client to sign. Generic
+ * counterpart to `buildUnsignedEscrowDeposit` (parameterized method/args
+ * instead of a hardcoded `deposit` call).
+ */
+async function buildUnsignedContractCall({ contractId, method, args, sourcePublicKey }) {
+  const source = await server.loadAccount(sourcePublicKey);
+  const contract = new Contract(contractId);
+  const tx = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(TX_TIMEOUT_CONTRIBUTION_S)
+    .build();
+
+  const preparedTx = await simulateAndPrepare(tx);
+  return preparedTx.toXDR();
+}
+
+/**
+ * Submits an already-signed contract-invocation transaction (built earlier by
+ * `buildUnsignedContractCall` and signed client-side), returning the tx hash
+ * and decoded return value. Mirrors `invokeContractRaw`'s submit/decode tail
+ * without the sign step, since the caller already holds a valid signature.
+ */
+async function submitSignedContractCall(signedXdr) {
+  const preparedTx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  const result = await server.submitTransaction(preparedTx);
+
+  if (result.status === 'SUCCESS') {
+    let returnValue = null;
+    if (result.resultMetaXdr) {
+      const resultMetaXdrParsed = xdr.TransactionMeta.fromXDR(result.resultMetaXdr, 'base64');
+      const sorobanMeta = resultMetaXdrParsed.v3().sorobanMeta();
+      if (sorobanMeta && sorobanMeta.returnValue()) {
+        returnValue = scValToNative(sorobanMeta.returnValue());
+      }
+    }
+    return { hash: result.hash, returnValue };
+  }
+  throw new Error(`Transaction failed: ${result.status}`);
+}
+
+class ContractCallValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ContractCallValidationError';
+    this.statusCode = 422;
+    this.isValidationError = true;
+  }
+}
+
+/**
+ * Validates that a client-signed contract-call transaction matches the
+ * server-generated unsigned XDR byte-for-byte (so its contract/method/args
+ * can't have been tampered with) and is signed by the expected account (so a
+ * signature from a different wallet can't be substituted). Mirrors
+ * `validateSubmittedWithdrawalXdr` in stellarService.js, generalized from a
+ * classic `payment` operation to a single Soroban `invokeHostFunction` op.
+ */
+function validateSubmittedContractCallXdr({ signedXdr, unsignedXdr, expectedSourcePublicKey }) {
+  if (!signedXdr) {
+    throw new ContractCallValidationError('signed_xdr is required');
+  }
+  if (!unsignedXdr) {
+    throw new ContractCallValidationError('Server-generated unsigned_xdr is required to verify this action');
+  }
+
+  let signedTx;
+  try {
+    signedTx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  } catch {
+    throw new ContractCallValidationError('Invalid signed_xdr');
+  }
+
+  let unsignedTx;
+  try {
+    unsignedTx = TransactionBuilder.fromXDR(unsignedXdr, networkPassphrase);
+  } catch {
+    throw new ContractCallValidationError('Invalid server-generated unsigned_xdr');
+  }
+
+  // The transaction hash covers the whole envelope body (source, sequence,
+  // operations, memo, time bounds) but not the signatures, so a match here
+  // proves the contract/method/args are exactly what the server prepared.
+  if (signedTx.hash().toString('hex') !== unsignedTx.hash().toString('hex')) {
+    throw new ContractCallValidationError('Signed transaction does not match the server-generated transaction');
+  }
+
+  if (signedTx.source !== expectedSourcePublicKey) {
+    throw new ContractCallValidationError('Transaction source does not match the expected wallet');
+  }
+
+  if (!signedTx.operations || signedTx.operations.length !== 1 || signedTx.operations[0].type !== 'invokeHostFunction') {
+    throw new ContractCallValidationError('Transaction must contain exactly one contract invocation');
+  }
+
+  if (!signedTx.signatures || signedTx.signatures.length === 0) {
+    throw new ContractCallValidationError('Signed transaction does not include any signatures');
+  }
+
+  let signer;
+  try {
+    signer = Keypair.fromPublicKey(expectedSourcePublicKey);
+  } catch {
+    throw new ContractCallValidationError('Invalid expected source public key');
+  }
+  const signatureValid = signedTx.signatures.some((decorated) => {
+    try {
+      return signer.verify(signedTx.hash(), decorated.signature());
+    } catch {
+      return false;
+    }
+  });
+  if (!signatureValid) {
+    throw new ContractCallValidationError('Signed transaction does not include a valid signature from the expected wallet');
+  }
+
+  return true;
+}
+
 async function invokeContractReadOnly({ contractId, method, args }) {
   const source = await server.loadAccount(
     Keypair.fromSecret(process.env.PLATFORM_SECRET_KEY).publicKey()
@@ -830,6 +954,10 @@ module.exports = {
   initializeMilestones,
   depositToEscrow,
   buildUnsignedEscrowDeposit,
+  buildUnsignedContractCall,
+  submitSignedContractCall,
+  validateSubmittedContractCallXdr,
+  ContractCallValidationError,
   isContractDepositEligible,
   isRealSorobanContract,
   requestRefund,

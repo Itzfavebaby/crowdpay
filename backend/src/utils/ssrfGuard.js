@@ -162,13 +162,27 @@ function isPrivateHost(hostname) {
 }
 
 /**
- * Resolve a hostname to IP addresses and check whether ANY of them are
- * private / internal. Returns true if the hostname resolves to at least
- * one private address (or if resolution fails entirely, as a safe default).
+ * Resolve a hostname to every A/AAAA record the system resolver returns.
+ * Throws if resolution fails entirely (callers treat that as unsafe).
  *
- * Uses dns.lookup which follows the system resolver and returns a single
- * address; for hosts with both A and AAAA records this will return the
- * first resolved address.
+ * @param {string} hostname
+ * @returns {Promise<{address: string, family: number}[]>}
+ */
+async function resolveAllAddresses(hostname) {
+  const records = await dns.lookup(hostname, { all: true, family: 0 });
+  if (!records || !records.length) {
+    throw new Error(`No addresses resolved for hostname: ${hostname}`);
+  }
+  return records;
+}
+
+/**
+ * Resolve a hostname and check whether ANY of its A/AAAA records are
+ * private/internal. A hostname with mixed public and private answers is
+ * treated as unsafe — checking only the first result (as dns.lookup's
+ * default single-address mode would) lets a private answer hide behind a
+ * public one. Returns true if resolution fails entirely too, as a safe
+ * default.
  *
  * @param {string} hostname
  * @returns {Promise<boolean>}
@@ -177,8 +191,8 @@ async function resolvesToPrivateIp(hostname) {
   if (typeof hostname !== 'string' || !hostname) return true;
 
   try {
-    const { address } = await dns.lookup(hostname, { family: 0 });
-    return isPrivateHost(address);
+    const records = await resolveAllAddresses(hostname);
+    return records.some((record) => isPrivateHost(record.address));
   } catch {
     // Resolution failure: safest to block
     logger.warn('[ssrfGuard] DNS resolution failed for hostname', { hostname });
@@ -187,21 +201,31 @@ async function resolvesToPrivateIp(hostname) {
 }
 
 /**
- * Validate that a URL is safe for outbound HTTP requests. Returns an object
- * with `{ safe: boolean, reason: string }`.
+ * Validate that a URL is safe for outbound HTTP requests AND resolve a
+ * single pinned address to actually connect to. Combining validation and
+ * resolution into one lookup closes the gap where a separate validate-then-
+ * connect (or validate-then-resolve-again) pair could observe a different
+ * DNS answer at each step (DNS rebinding). The original hostname is still
+ * returned for the caller to use as the TLS SNI / Host header — only the
+ * connection target is pinned to the resolved address.
+ *
+ * Returns `{ safe: boolean, reason: string, hostname, pinnedAddress, family }`.
+ * `pinnedAddress`/`family` are only present when `safe` is true and the host
+ * needed DNS resolution (a raw-IP URL has no separate pinned address to add —
+ * the hostname itself already is the connect target).
  *
  * Rules:
  *  - Must be http: or https:
  *  - http: only allowed for localhost / 127.0.0.1 / ::1 in dev
  *  - Hostname must not be a private IP or blocked hostname
- *  - Resolved DNS must not point to a private IP
+ *  - Every resolved A/AAAA record must be public
  *
  * @param {string} urlString
  * @param {object} [options]
  * @param {boolean} [options.allowLocalhostHttp] - allow http://localhost (default: NODE_ENV !== 'production')
- * @returns {Promise<{safe: boolean, reason: string}>}
+ * @returns {Promise<{safe: boolean, reason: string, hostname?: string, pinnedAddress?: string, family?: number}>}
  */
-async function isSafeUrl(urlString, options = {}) {
+async function resolveSafeConnectTarget(urlString, options = {}) {
   const allowLocalhostHttp = options.allowLocalhostHttp !== undefined
     ? options.allowLocalhostHttp
     : process.env.NODE_ENV !== 'production';
@@ -236,23 +260,53 @@ async function isSafeUrl(urlString, options = {}) {
   const isAllowedLocalhostHttp = u.protocol === 'http:' && allowLocalhostHttp &&
     (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1');
 
+  if (isAllowedLocalhostHttp) {
+    return { safe: true, reason: '', hostname, pinnedAddress: hostname === 'localhost' ? '127.0.0.1' : hostname };
+  }
+
   // Check if hostname itself is private/blocked (handles raw IPs).
-  // Skip for explicitly-allowed localhost addresses.
-  if (!isAllowedLocalhostHttp && isPrivateHost(hostname)) {
+  if (isPrivateHost(hostname)) {
     return { safe: false, reason: `Hostname resolves to a private/internal address: ${hostname}` };
   }
 
-  // DNS resolution check: ensure the hostname doesn't resolve to a private IP.
-  // Skip for explicitly-allowed localhost/loopback and for raw IP addresses
-  // (which have already been checked above).
-  if (!isAllowedLocalhostHttp && net.isIP(hostname) === 0) {
-    const privateResolved = await resolvesToPrivateIp(hostname);
-    if (privateResolved) {
-      return { safe: false, reason: `Hostname resolves to a private/internal network: ${hostname}` };
-    }
+  // Raw IP hostnames have no further resolution — they're already the pin target.
+  if (net.isIP(hostname) !== 0) {
+    return { safe: true, reason: '', hostname, pinnedAddress: hostname, family: net.isIP(hostname) };
   }
 
-  return { safe: true, reason: '' };
+  // Resolve once, validate every answer, and pin the connection to one of
+  // the validated addresses — the same lookup backs both checks, so there's
+  // no window between "validated" and "connected" for the answer to change.
+  let records;
+  try {
+    records = await resolveAllAddresses(hostname);
+  } catch {
+    logger.warn('[ssrfGuard] DNS resolution failed for hostname', { hostname });
+    return { safe: false, reason: `DNS resolution failed for hostname: ${hostname}` };
+  }
+  const privateRecord = records.find((record) => isPrivateHost(record.address));
+  if (privateRecord) {
+    return {
+      safe: false,
+      reason: `Hostname resolves to a private/internal network: ${hostname} -> ${privateRecord.address}`,
+    };
+  }
+
+  return { safe: true, reason: '', hostname, pinnedAddress: records[0].address, family: records[0].family };
+}
+
+/**
+ * Backward-compatible boolean-safety check. Prefer `resolveSafeConnectTarget`
+ * for anything that will actually open a connection, since it hands back the
+ * pinned address to connect to instead of re-resolving later.
+ *
+ * @param {string} urlString
+ * @param {object} [options]
+ * @returns {Promise<{safe: boolean, reason: string}>}
+ */
+async function isSafeUrl(urlString, options = {}) {
+  const { safe, reason } = await resolveSafeConnectTarget(urlString, options);
+  return { safe, reason };
 }
 
 module.exports = {
@@ -260,6 +314,8 @@ module.exports = {
   isPrivateIpv6,
   isPrivateHost,
   resolvesToPrivateIp,
+  resolveAllAddresses,
+  resolveSafeConnectTarget,
   isSafeUrl,
   isBlockedHostname,
   IPV4_BLOCKED_RANGES,

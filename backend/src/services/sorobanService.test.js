@@ -456,6 +456,133 @@ describe('sorobanService real implementation tests', () => {
       assert.ok(xdrString.length > 0);
     });
 
+    test('buildUnsignedContractCall builds an unsigned XDR for an arbitrary method without a signerSecret', async () => {
+      const service = buildService();
+
+      const xdrString = await service.buildUnsignedContractCall({
+        contractId: TEST_CONTRACT_ID,
+        method: 'propose_change',
+        args: [],
+        sourcePublicKey: TEST_PUBLIC,
+      });
+
+      assert.equal(typeof xdrString, 'string');
+      assert.ok(xdrString.length > 0);
+    });
+
+    test('submitSignedContractCall submits an already-signed transaction and decodes its return value', async () => {
+      const returnScVal = nativeToScVal(7);
+      const metaBase64 = createMockMetaXdr(returnScVal);
+      const service = buildService({
+        submitTransaction: async () => ({ status: 'SUCCESS', hash: 'submitted-hash', resultMetaXdr: metaBase64 }),
+      });
+
+      const unsignedXdr = await service.buildUnsignedContractCall({
+        contractId: TEST_CONTRACT_ID,
+        method: 'vote',
+        args: [],
+        sourcePublicKey: TEST_PUBLIC,
+      });
+      const { TransactionBuilder } = require('@stellar/stellar-sdk');
+      const tx = TransactionBuilder.fromXDR(unsignedXdr, 'Test SDF Network ; September 2015');
+      tx.sign(testKeypair);
+
+      const result = await service.submitSignedContractCall(tx.toXDR());
+      assert.equal(result.hash, 'submitted-hash');
+      assert.equal(result.returnValue, BigInt(7));
+    });
+
+    test('submitSignedContractCall throws on a non-SUCCESS submission status', async () => {
+      const service = buildService({ submitTransaction: async () => ({ status: 'FAILED' }) });
+      const unsignedXdr = await service.buildUnsignedContractCall({
+        contractId: TEST_CONTRACT_ID,
+        method: 'vote',
+        args: [],
+        sourcePublicKey: TEST_PUBLIC,
+      });
+      const { TransactionBuilder } = require('@stellar/stellar-sdk');
+      const tx = TransactionBuilder.fromXDR(unsignedXdr, 'Test SDF Network ; September 2015');
+      tx.sign(testKeypair);
+
+      await assert.rejects(() => service.submitSignedContractCall(tx.toXDR()), /Transaction failed: FAILED/);
+    });
+
+    describe('validateSubmittedContractCallXdr (#802 — cross-wallet and tampered-args rejection)', () => {
+      async function buildSignedAndUnsigned(service, { method = 'vote', args = [], signer = testKeypair, sourcePublicKey = TEST_PUBLIC } = {}) {
+        const unsignedXdr = await service.buildUnsignedContractCall({
+          contractId: TEST_CONTRACT_ID,
+          method,
+          args,
+          sourcePublicKey,
+        });
+        const { TransactionBuilder } = require('@stellar/stellar-sdk');
+        const tx = TransactionBuilder.fromXDR(unsignedXdr, 'Test SDF Network ; September 2015');
+        tx.sign(signer);
+        return { unsignedXdr, signedXdr: tx.toXDR() };
+      }
+
+      test('accepts a signed transaction that matches the unsigned XDR and is signed by the expected wallet', async () => {
+        const service = buildService();
+        const { unsignedXdr, signedXdr } = await buildSignedAndUnsigned(service);
+
+        assert.equal(
+          service.validateSubmittedContractCallXdr({
+            signedXdr,
+            unsignedXdr,
+            expectedSourcePublicKey: TEST_PUBLIC,
+          }),
+          true,
+        );
+      });
+
+      test('rejects a transaction signed by a different wallet than expected (cross-wallet signature)', async () => {
+        const service = buildService();
+        const attacker = Keypair.random();
+        // Attacker's own account is the tx source, but we claim the victim's key is expected.
+        const { unsignedXdr, signedXdr } = await buildSignedAndUnsigned(service, {
+          signer: attacker,
+          sourcePublicKey: attacker.publicKey(),
+        });
+
+        assert.throws(
+          () => service.validateSubmittedContractCallXdr({
+            signedXdr,
+            unsignedXdr,
+            expectedSourcePublicKey: TEST_PUBLIC,
+          }),
+          /does not match the expected wallet/,
+        );
+      });
+
+      test('rejects a signed transaction whose operation args were tampered with after preparing', async () => {
+        const service = buildService();
+        const { unsignedXdr } = await buildSignedAndUnsigned(service, { args: [nativeToScVal(false, { type: 'bool' })] });
+        // Build a DIFFERENT transaction (different args) but present it as satisfying the same prepare token.
+        const { signedXdr: tamperedSignedXdr } = await buildSignedAndUnsigned(service, { args: [nativeToScVal(true, { type: 'bool' })] });
+
+        assert.throws(
+          () => service.validateSubmittedContractCallXdr({
+            signedXdr: tamperedSignedXdr,
+            unsignedXdr,
+            expectedSourcePublicKey: TEST_PUBLIC,
+          }),
+          /does not match the server-generated transaction/,
+        );
+      });
+
+      test('rejects when signed_xdr or unsigned_xdr is missing', () => {
+        const service = buildService();
+        assert.throws(
+          () => service.validateSubmittedContractCallXdr({ signedXdr: null, unsignedXdr: 'x', expectedSourcePublicKey: TEST_PUBLIC }),
+          /signed_xdr is required/,
+        );
+        assert.throws(
+          () => service.validateSubmittedContractCallXdr({ signedXdr: 'x', unsignedXdr: null, expectedSourcePublicKey: TEST_PUBLIC }),
+          /unsigned_xdr is required/,
+        );
+      });
+    });
+
     test('isContractDepositEligible requires SOROBAN_ENABLED=true and an escrow_contract_id', () => {
       const service = buildService();
       const prevEnabled = process.env.SOROBAN_ENABLED;

@@ -9,6 +9,7 @@ const silentLogger = { info: () => {}, error: () => {}, warn: () => {}, debug: (
 const W = (n) => `G${n}`; // stub wallet keys
 
 process.env.GOVERNANCE_TOKEN_ID = 'ISSUER';
+process.env.FEE_REGISTRY_CONTRACT_ID = 'CFEEREGISTRY';
 
 // delegations[delegator] = delegate
 function buildService({ delegations = {}, balances = {} }) {
@@ -152,4 +153,161 @@ test('getAllTransitiveDelegatorWallets returns indirect delegators', async () =>
   });
   const wallets = await service.getAllTransitiveDelegatorWallets(W('C')).then((arr) => arr.sort());
   assert.deepEqual(wallets, [W('A'), W('B'), W('D')].sort());
+});
+
+// ---------------------------------------------------------------------------
+// #802 — wallet-signing: propose/vote/execute prepare+submit flows
+// ---------------------------------------------------------------------------
+
+function buildProposalService({
+  proposalRow = { stellar_proposal_id: 42, status: 'active', deadline: new Date(Date.now() + 1000 * 60 * 60).toISOString() },
+  balances = {},
+  invokeContractImpl,
+  submitSignedContractCallImpl,
+  buildUnsignedContractCallImpl,
+} = {}) {
+  const queries = [];
+  return {
+    queries,
+    service: proxyquire('./governance', {
+      '../config/database': {
+        query: async (text, params) => {
+          queries.push({ text, params });
+          if (/SELECT stellar_proposal_id, status, deadline FROM governance_proposals_meta/.test(text)) {
+            return { rows: [proposalRow] };
+          }
+          if (/SELECT stellar_proposal_id, status FROM governance_proposals_meta/.test(text)) {
+            return { rows: [proposalRow] };
+          }
+          if (/INSERT INTO governance_proposals_meta/.test(text)) {
+            return { rows: [{ id: 'db-proposal-1' }] };
+          }
+          if (/INSERT INTO governance_votes_log/.test(text)) {
+            return { rows: [] };
+          }
+          if (/UPDATE governance_proposals_meta/.test(text)) {
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+      },
+      '../config/stellar': {
+        server: {
+          loadAccount: async (publicKey) => ({
+            balances: [{ asset_code: 'CROWD', asset_issuer: 'ISSUER', balance: String(balances[publicKey] ?? 5000) }],
+          }),
+        },
+      },
+      './sorobanService': {
+        invokeContract: invokeContractImpl || (async () => 42),
+        invokeContractReadOnly: async () => ({ id: 42, votes_for: 10, votes_against: 2, deadline: 0, status: { tag: 'Passed' } }),
+        buildUnsignedContractCall: buildUnsignedContractCallImpl || (async () => 'UNSIGNED_XDR'),
+        submitSignedContractCall: submitSignedContractCallImpl || (async () => ({ hash: 'txhash', returnValue: 42 })),
+        nativeToScVal: (v) => v,
+      },
+      '../config/logger': silentLogger,
+    }),
+  };
+}
+
+test('createProposal (custodial) records the proposal without any client-supplied wallet identity', async () => {
+  const { service, queries } = buildProposalService({ balances: { [W('P')]: 5000 } });
+  const proposal = await service.createProposal(W('P'), 300, 500, 'Reduce fees for creators', 'SPLACEHOLDERSECRET');
+
+  assert.equal(proposal.proposer, W('P'));
+  assert.equal(proposal.stellar_proposal_id, 42);
+  const insertCall = queries.find((q) => /INSERT INTO governance_proposals_meta/.test(q.text));
+  assert.ok(insertCall);
+});
+
+test('buildUnsignedProposal + createProposalFromSignedXdr round-trips a Freighter proposal', async () => {
+  const { service, queries } = buildProposalService({ balances: { [W('P')]: 5000 } });
+
+  const unsignedXdr = await service.buildUnsignedProposal({
+    proposerPublicKey: W('P'),
+    newFeeBps: 300,
+    newCreatorShareBps: 500,
+  });
+  assert.equal(unsignedXdr, 'UNSIGNED_XDR');
+
+  const proposal = await service.createProposalFromSignedXdr({
+    signedXdr: 'SIGNED_XDR',
+    proposerPublicKey: W('P'),
+    newFeeBps: 300,
+    newCreatorShareBps: 500,
+    rationaleText: 'Reduce fees',
+  });
+
+  assert.equal(proposal.proposer, W('P'));
+  assert.equal(proposal.stellar_proposal_id, 42);
+  assert.ok(queries.find((q) => /INSERT INTO governance_proposals_meta/.test(q.text)));
+});
+
+test('buildUnsignedProposal rejects a proposer without enough governance tokens before building any XDR', async () => {
+  const { service } = buildProposalService({ balances: { [W('P')]: 10 } });
+  await assert.rejects(
+    () => service.buildUnsignedProposal({ proposerPublicKey: W('P'), newFeeBps: 300, newCreatorShareBps: 500 }),
+    /must hold/
+  );
+});
+
+test('voteOnProposal (custodial) and voteFromSignedXdr (Freighter) both record identical vote shapes', async () => {
+  const { service: custodialService } = buildProposalService({ balances: { [W('V')]: 1000 } });
+  const custodialResult = await custodialService.voteOnProposal('db-proposal-1', W('V'), true, 'SSECRET');
+  assert.equal(custodialResult.voter, W('V'));
+  assert.equal(custodialResult.in_favor, true);
+  assert.equal(custodialResult.token_balance, 1000);
+
+  const { service: freighterService, queries } = buildProposalService({ balances: { [W('V')]: 1000 } });
+  const unsignedXdr = await freighterService.buildUnsignedVote({ proposalId: 'db-proposal-1', voterPublicKey: W('V'), inFavor: true });
+  assert.equal(unsignedXdr, 'UNSIGNED_XDR');
+
+  const freighterResult = await freighterService.voteFromSignedXdr({
+    signedXdr: 'SIGNED_XDR',
+    proposalId: 'db-proposal-1',
+    voterPublicKey: W('V'),
+    inFavor: true,
+  });
+  assert.equal(freighterResult.voter, W('V'));
+  assert.ok(queries.find((q) => /INSERT INTO governance_votes_log/.test(q.text)));
+});
+
+test('voteFromSignedXdr re-validates eligibility at submit time (proposal no longer active)', async () => {
+  const { service } = buildProposalService({
+    proposalRow: { stellar_proposal_id: 42, status: 'passed' },
+    balances: { [W('V')]: 1000 },
+  });
+  await assert.rejects(
+    () => service.voteFromSignedXdr({ signedXdr: 'SIGNED_XDR', proposalId: 'db-proposal-1', voterPublicKey: W('V'), inFavor: true }),
+    /not active/
+  );
+});
+
+test('executeProposal uses the provided relayer secret, never a per-user secret, and enforces status + deadline', async () => {
+  const capturedSigners = [];
+  const { service } = buildProposalService({
+    proposalRow: { stellar_proposal_id: 42, status: 'active', deadline: new Date(Date.now() - 1000).toISOString() },
+    invokeContractImpl: async ({ signerSecret }) => {
+      capturedSigners.push(signerSecret);
+      return null;
+    },
+  });
+
+  const result = await service.executeProposal('db-proposal-1', 'PLATFORM_RELAYER_SECRET');
+  assert.deepEqual(capturedSigners, ['PLATFORM_RELAYER_SECRET']);
+  assert.equal(result.proposal_id, 'db-proposal-1');
+});
+
+test('executeProposal rejects a proposal whose deadline has not passed yet', async () => {
+  const { service } = buildProposalService({
+    proposalRow: { stellar_proposal_id: 42, status: 'active', deadline: new Date(Date.now() + 1000 * 60 * 60).toISOString() },
+  });
+  await assert.rejects(() => service.executeProposal('db-proposal-1', 'SECRET'), /deadline has not passed/);
+});
+
+test('executeProposal rejects a proposal that is not active (already executed)', async () => {
+  const { service } = buildProposalService({
+    proposalRow: { stellar_proposal_id: 42, status: 'executed', deadline: new Date(Date.now() - 1000).toISOString() },
+  });
+  await assert.rejects(() => service.executeProposal('db-proposal-1', 'SECRET'), /not active/);
 });

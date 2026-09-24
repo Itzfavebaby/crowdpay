@@ -1,4 +1,10 @@
-const { invokeContract, invokeContractReadOnly, nativeToScVal, scValToNative } = require('./sorobanService');
+const {
+  invokeContract,
+  invokeContractReadOnly,
+  buildUnsignedContractCall,
+  submitSignedContractCall,
+  nativeToScVal,
+} = require('./sorobanService');
 const { server } = require('../config/stellar');
 const logger = require('../config/logger');
 const db = require('../config/database');
@@ -366,12 +372,66 @@ async function getEffectiveVoteWeight(publicKey) {
 }
 
 /**
- * Create a proposal on-chain.
- * @param {string} proposerPublicKey - Proposer's Stellar public key
+ * Args for the contract's `propose_change` method, shared by the custodial
+ * inline-sign path and the Freighter build-unsigned-XDR path so both produce
+ * an identical operation for the same inputs.
+ */
+function proposeChangeArgs(proposerPublicKey, newFeeBps, newCreatorShareBps) {
+  return [
+    nativeToScVal(proposerPublicKey, { type: 'address' }),
+    nativeToScVal(newFeeBps, { type: 'u32' }),
+    nativeToScVal(newCreatorShareBps, { type: 'u32' }),
+  ];
+}
+
+/** Persists a just-created on-chain proposal's metadata. */
+async function recordProposalCreated({
+  stellarProposalId,
+  proposerPublicKey,
+  newFeeBps,
+  newCreatorShareBps,
+  rationaleText,
+}) {
+  const insertQuery = `
+    INSERT INTO governance_proposals_meta
+    (stellar_proposal_id, proposer, rationale_text, proposed_fee_bps, proposed_creator_share_bps, status, votes_for, votes_against, deadline)
+    VALUES ($1, $2, $3, $4, $5, 'active', 0, 0, NOW() + INTERVAL '7 days')
+    RETURNING id
+  `;
+
+  const result = await db.query(insertQuery, [
+    Number(stellarProposalId),
+    proposerPublicKey,
+    rationaleText,
+    newFeeBps,
+    newCreatorShareBps,
+  ]);
+
+  logger.info('Proposal created', {
+    proposalId: result.rows[0].id,
+    stellarProposalId,
+    proposer: proposerPublicKey,
+  });
+
+  return {
+    id: result.rows[0].id,
+    stellar_proposal_id: Number(stellarProposalId),
+    proposer: proposerPublicKey,
+    rationale_text: rationaleText,
+    proposed_fee_bps: newFeeBps,
+    proposed_creator_share_bps: newCreatorShareBps,
+    status: 'active',
+  };
+}
+
+/**
+ * Create a proposal on-chain (custodial wallets — server holds the signing key).
+ * @param {string} proposerPublicKey - Proposer's Stellar public key, resolved
+ *   server-side from the authenticated user; never trust a client-supplied key.
  * @param {number} newFeeBps - Proposed platform fee in basis points
  * @param {number} newCreatorShareBps - Proposed creator share in basis points
  * @param {string} rationaleText - Rationale for the proposal
- * @param {string} signerSecret - Signer's secret key
+ * @param {string} signerSecret - Decrypted custodial secret for proposerPublicKey
  * @returns {Promise<object>} Created proposal data
  */
 async function createProposal(proposerPublicKey, newFeeBps, newCreatorShareBps, rationaleText, signerSecret) {
@@ -379,56 +439,26 @@ async function createProposal(proposerPublicKey, newFeeBps, newCreatorShareBps, 
     throw new Error('FEE_REGISTRY_CONTRACT_ID not configured');
   }
 
-  // Check token balance
   const hasTokens = await checkUserTokenBalance(proposerPublicKey);
   if (!hasTokens) {
     throw new Error('Proposer must hold at least 1,000 governance tokens');
   }
 
   try {
-    // Call propose_change on contract
     const proposalId = await invokeContract({
       contractId: FEE_REGISTRY_CONTRACT_ID,
       method: 'propose_change',
-      args: [
-        nativeToScVal(proposerPublicKey, { type: 'address' }),
-        nativeToScVal(newFeeBps, { type: 'u32' }),
-        nativeToScVal(newCreatorShareBps, { type: 'u32' }),
-      ],
+      args: proposeChangeArgs(proposerPublicKey, newFeeBps, newCreatorShareBps),
       signerSecret,
     });
 
-    // Store proposal metadata in database
-    const insertQuery = `
-      INSERT INTO governance_proposals_meta 
-      (stellar_proposal_id, proposer, rationale_text, proposed_fee_bps, proposed_creator_share_bps, status, votes_for, votes_against, deadline)
-      VALUES ($1, $2, $3, $4, $5, 'active', 0, 0, NOW() + INTERVAL '7 days')
-      RETURNING id
-    `;
-
-    const result = await db.query(insertQuery, [
-      Number(proposalId),
+    return await recordProposalCreated({
+      stellarProposalId: proposalId,
       proposerPublicKey,
-      rationaleText,
       newFeeBps,
       newCreatorShareBps,
-    ]);
-
-    logger.info('Proposal created', { 
-      proposalId: result.rows[0].id, 
-      stellarProposalId: proposalId,
-      proposer: proposerPublicKey 
+      rationaleText,
     });
-
-    return {
-      id: result.rows[0].id,
-      stellar_proposal_id: Number(proposalId),
-      proposer: proposerPublicKey,
-      rationale_text: rationaleText,
-      proposed_fee_bps: newFeeBps,
-      proposed_creator_share_bps: newCreatorShareBps,
-      status: 'active',
-    };
   } catch (error) {
     logger.error('Failed to create proposal', { error: error.message });
     throw error;
@@ -436,30 +466,75 @@ async function createProposal(proposerPublicKey, newFeeBps, newCreatorShareBps, 
 }
 
 /**
- * Vote on a proposal on-chain.
- * @param {number} proposalId - Database proposal ID
- * @param {string} voterPublicKey - Voter's Stellar public key
- * @param {boolean} inFavor - Whether vote is in favor
- * @param {string} signerSecret - Signer's secret key
- * @returns {Promise<object>} Vote result
+ * Builds the unsigned `propose_change` XDR for a Freighter (self-custody)
+ * proposer to sign in the browser. Checks the token-balance gate up front so
+ * the client isn't asked to sign a transaction that will just be rejected.
  */
-async function voteOnProposal(proposalId, voterPublicKey, inFavor, signerSecret) {
+async function buildUnsignedProposal({ proposerPublicKey, newFeeBps, newCreatorShareBps }) {
+  if (!FEE_REGISTRY_CONTRACT_ID) {
+    throw new Error('FEE_REGISTRY_CONTRACT_ID not configured');
+  }
+  const hasTokens = await checkUserTokenBalance(proposerPublicKey);
+  if (!hasTokens) {
+    throw new Error('Proposer must hold at least 1,000 governance tokens');
+  }
+  return buildUnsignedContractCall({
+    contractId: FEE_REGISTRY_CONTRACT_ID,
+    method: 'propose_change',
+    args: proposeChangeArgs(proposerPublicKey, newFeeBps, newCreatorShareBps),
+    sourcePublicKey: proposerPublicKey,
+  });
+}
+
+/**
+ * Submits a client-signed `propose_change` transaction (already validated by
+ * the route against the prepare token it was built from) and records the
+ * resulting proposal.
+ */
+async function createProposalFromSignedXdr({
+  signedXdr,
+  proposerPublicKey,
+  newFeeBps,
+  newCreatorShareBps,
+  rationaleText,
+}) {
+  const { returnValue: stellarProposalId } = await submitSignedContractCall(signedXdr);
+  return recordProposalCreated({
+    stellarProposalId,
+    proposerPublicKey,
+    newFeeBps,
+    newCreatorShareBps,
+    rationaleText,
+  });
+}
+
+function voteArgs(voterPublicKey, stellarProposalId, inFavor) {
+  return [
+    nativeToScVal(voterPublicKey, { type: 'address' }),
+    nativeToScVal(stellarProposalId, { type: 'u32' }),
+    nativeToScVal(inFavor, { type: 'bool' }),
+  ];
+}
+
+/**
+ * Loads a proposal and computes the voter's effective weight, validating both
+ * before any transaction is built or submitted. Shared by the custodial vote
+ * path, the Freighter prepare step, and the Freighter submit step, so all
+ * three enforce identical eligibility rules.
+ */
+async function prepareVoteContext(proposalId, voterPublicKey) {
   if (!FEE_REGISTRY_CONTRACT_ID) {
     throw new Error('FEE_REGISTRY_CONTRACT_ID not configured');
   }
 
-  // Get proposal from database
-  const proposalQuery = `
-    SELECT stellar_proposal_id, status FROM governance_proposals_meta WHERE id = $1
-  `;
-  const proposalResult = await db.query(proposalQuery, [proposalId]);
-
+  const proposalResult = await db.query(
+    'SELECT stellar_proposal_id, status FROM governance_proposals_meta WHERE id = $1',
+    [proposalId]
+  );
   if (proposalResult.rows.length === 0) {
     throw new Error('Proposal not found');
   }
-
   const proposal = proposalResult.rows[0];
-
   if (proposal.status !== 'active') {
     throw new Error('Proposal is not active for voting');
   }
@@ -471,45 +546,84 @@ async function voteOnProposal(proposalId, voterPublicKey, inFavor, signerSecret)
     throw new Error('Voter must hold governance tokens');
   }
 
+  return { proposal, effectiveWeight };
+}
+
+async function recordVoteCast({ proposalId, voterPublicKey, inFavor, effectiveWeight }) {
+  await db.query(
+    `INSERT INTO governance_votes_log (proposal_id, voter_public_key, in_favor, token_balance_at_vote, voted_at)
+     VALUES ($1, $2, $3, $4, NOW())`,
+    [proposalId, voterPublicKey, inFavor, effectiveWeight]
+  );
+  logger.info('Vote recorded', { proposalId, voter: voterPublicKey, inFavor, weight: effectiveWeight });
+  return {
+    proposal_id: proposalId,
+    voter: voterPublicKey,
+    in_favor: inFavor,
+    token_balance: effectiveWeight,
+  };
+}
+
+/**
+ * Vote on a proposal on-chain (custodial wallets — server holds the signing key).
+ * @param {number} proposalId - Database proposal ID
+ * @param {string} voterPublicKey - Voter's Stellar public key, resolved
+ *   server-side from the authenticated user; never trust a client-supplied key.
+ * @param {boolean} inFavor - Whether vote is in favor
+ * @param {string} signerSecret - Decrypted custodial secret for voterPublicKey
+ * @returns {Promise<object>} Vote result
+ */
+async function voteOnProposal(proposalId, voterPublicKey, inFavor, signerSecret) {
+  const { proposal, effectiveWeight } = await prepareVoteContext(proposalId, voterPublicKey);
+
   try {
-    // Call vote on contract
     await invokeContract({
       contractId: FEE_REGISTRY_CONTRACT_ID,
       method: 'vote',
-      args: [
-        nativeToScVal(voterPublicKey, { type: 'address' }),
-        nativeToScVal(proposal.stellar_proposal_id, { type: 'u32' }),
-        nativeToScVal(inFavor, { type: 'bool' }),
-      ],
+      args: voteArgs(voterPublicKey, proposal.stellar_proposal_id, inFavor),
       signerSecret,
     });
 
-    // Log vote in database
-    const insertVoteQuery = `
-      INSERT INTO governance_votes_log (proposal_id, voter_public_key, in_favor, token_balance_at_vote, voted_at)
-      VALUES ($1, $2, $3, $4, NOW())
-    `;
-
-    await db.query(insertVoteQuery, [proposalId, voterPublicKey, inFavor, effectiveWeight]);
-
-    logger.info('Vote recorded', { proposalId, voter: voterPublicKey, inFavor, weight: effectiveWeight });
-
-    return {
-      proposal_id: proposalId,
-      voter: voterPublicKey,
-      in_favor: inFavor,
-      token_balance: effectiveWeight,
-    };
+    return await recordVoteCast({ proposalId, voterPublicKey, inFavor, effectiveWeight });
   } catch (error) {
     logger.error('Failed to vote on proposal', { error: error.message, proposalId });
     throw error;
   }
 }
 
+/** Builds the unsigned `vote` XDR for a Freighter voter to sign in the browser. */
+async function buildUnsignedVote({ proposalId, voterPublicKey, inFavor }) {
+  const { proposal } = await prepareVoteContext(proposalId, voterPublicKey);
+  return buildUnsignedContractCall({
+    contractId: FEE_REGISTRY_CONTRACT_ID,
+    method: 'vote',
+    args: voteArgs(voterPublicKey, proposal.stellar_proposal_id, inFavor),
+    sourcePublicKey: voterPublicKey,
+  });
+}
+
 /**
- * Execute a proposal on-chain.
+ * Submits a client-signed `vote` transaction (already validated by the route
+ * against the prepare token it was built from) and records the vote.
+ * Re-validates eligibility at submit time in case anything changed since the
+ * vote was prepared (proposal closed, delegation revoked, etc).
+ */
+async function voteFromSignedXdr({ signedXdr, proposalId, voterPublicKey, inFavor }) {
+  const { effectiveWeight } = await prepareVoteContext(proposalId, voterPublicKey);
+  await submitSignedContractCall(signedXdr);
+  return recordVoteCast({ proposalId, voterPublicKey, inFavor, effectiveWeight });
+}
+
+/**
+ * Execute a proposal on-chain via the platform relayer key. No per-user
+ * signature is meaningful here — the contract doesn't gate execution on a
+ * specific caller's authorization, so the platform key (already used as a
+ * relayer/co-signer elsewhere, e.g. withdrawal platform-approval) submits on
+ * behalf of whichever authenticated user triggers it. Status and deadline are
+ * pre-checked here so an ineligible proposal fails fast with a clear error
+ * rather than only via the contract's own on-chain rejection.
  * @param {number} proposalId - Database proposal ID
- * @param {string} signerSecret - Signer's secret key
+ * @param {string} signerSecret - Platform relayer secret key (never a user's own key)
  * @returns {Promise<object>} Execution result
  */
 async function executeProposal(proposalId, signerSecret) {
@@ -517,12 +631,10 @@ async function executeProposal(proposalId, signerSecret) {
     throw new Error('FEE_REGISTRY_CONTRACT_ID not configured');
   }
 
-  // Get proposal from database
-  const proposalQuery = `
-    SELECT stellar_proposal_id, status FROM governance_proposals_meta WHERE id = $1
-  `;
-  const proposalResult = await db.query(proposalQuery, [proposalId]);
-
+  const proposalResult = await db.query(
+    'SELECT stellar_proposal_id, status, deadline FROM governance_proposals_meta WHERE id = $1',
+    [proposalId]
+  );
   if (proposalResult.rows.length === 0) {
     throw new Error('Proposal not found');
   }
@@ -532,9 +644,11 @@ async function executeProposal(proposalId, signerSecret) {
   if (proposal.status !== 'active') {
     throw new Error('Proposal is not active');
   }
+  if (new Date(proposal.deadline) > new Date()) {
+    throw new Error('Proposal deadline has not passed yet');
+  }
 
   try {
-    // Call execute_proposal on contract
     await invokeContract({
       contractId: FEE_REGISTRY_CONTRACT_ID,
       method: 'execute_proposal',
@@ -550,7 +664,7 @@ async function executeProposal(proposalId, signerSecret) {
 
     // Update database
     const updateQuery = `
-      UPDATE governance_proposals_meta 
+      UPDATE governance_proposals_meta
       SET status = $1, executed_at = NOW()
       WHERE id = $2
     `;
@@ -611,7 +725,11 @@ module.exports = {
   checkUserTokenBalance,
   getUserTokenBalance,
   createProposal,
+  buildUnsignedProposal,
+  createProposalFromSignedXdr,
   voteOnProposal,
+  buildUnsignedVote,
+  voteFromSignedXdr,
   executeProposal,
   syncProposalData,
   setVoteDelegation,

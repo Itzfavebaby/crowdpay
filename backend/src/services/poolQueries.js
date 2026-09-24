@@ -1,4 +1,11 @@
 const db = require('../config/database');
+const { submitCustodialContribution } = require('./contributionService');
+
+function poolError(message, statusCode) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
 
 /**
  * List all pools for a campaign (public).
@@ -86,40 +93,56 @@ async function create({ campaign_id, leader_id, title, description, target_amoun
 }
 
 /**
- * Join a pool with a share amount.
+ * Join a pool with a share amount. Runs inside a transaction with the pool
+ * row locked (`FOR UPDATE`) so concurrent joins for the same pool serialize:
+ * the remaining-capacity check can't be jointly overshot, and a duplicate
+ * membership insert is caught by the `pool_members(pool_id, user_id)` unique
+ * constraint via `ON CONFLICT DO NOTHING` rather than a racy check-then-insert.
+ * Members are inserted directly as 'confirmed' — joining a pool is committing
+ * to a share; the existing `leave` endpoint is the opt-out path.
  */
 async function join({ pool_id, user_id, share_amount, display_name }) {
-  // Check pool is open
-  const pool = await db.query(
-    `SELECT * FROM contribution_pools WHERE id = $1 AND status = 'open'`,
-    [pool_id]
-  );
-  if (pool.rows.length === 0) throw new Error('Pool is not open or does not exist');
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
 
-  // Check user not already a member
-  const existing = await db.query(
-    `SELECT id FROM pool_members WHERE pool_id = $1 AND user_id = $2`,
-    [pool_id, user_id]
-  );
-  if (existing.rows.length > 0) throw new Error('Already a member of this pool');
+    const { rows: poolRows } = await client.query(
+      `SELECT * FROM contribution_pools WHERE id = $1 AND status = 'open' FOR UPDATE`,
+      [pool_id]
+    );
+    if (poolRows.length === 0) {
+      throw poolError('Pool is not open or does not exist', 404);
+    }
+    const pool = poolRows[0];
 
-  // Check share doesn't exceed remaining target
-  const totalShare = await db.query(
-    `SELECT COALESCE(SUM(share_amount), 0) AS total FROM pool_members WHERE pool_id = $1 AND status IN ('pending', 'confirmed')`,
-    [pool_id]
-  );
-  const remaining = parseFloat(pool.rows[0].target_amount) - parseFloat(totalShare.rows[0].total);
-  if (share_amount > remaining) {
-    throw new Error(`Share amount exceeds remaining pool target. Remaining: ${remaining}`);
+    const { rows: totalRows } = await client.query(
+      `SELECT COALESCE(SUM(share_amount), 0) AS total FROM pool_members WHERE pool_id = $1 AND status IN ('pending', 'confirmed')`,
+      [pool_id]
+    );
+    const remaining = parseFloat(pool.target_amount) - parseFloat(totalRows[0].total);
+    if (parseFloat(share_amount) > remaining) {
+      throw poolError(`Share amount exceeds remaining pool target. Remaining: ${remaining}`, 400);
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO pool_members (pool_id, user_id, share_amount, display_name, status)
+       VALUES ($1, $2, $3, $4, 'confirmed')
+       ON CONFLICT (pool_id, user_id) DO NOTHING
+       RETURNING *`,
+      [pool_id, user_id, share_amount, display_name]
+    );
+    if (rows.length === 0) {
+      throw poolError('Already a member of this pool', 409);
+    }
+
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const { rows } = await db.query(
-    `INSERT INTO pool_members (pool_id, user_id, share_amount, display_name, status)
-     VALUES ($1, $2, $3, $4, 'pending')
-     RETURNING *`,
-    [pool_id, user_id, share_amount, display_name]
-  );
-  return rows[0];
 }
 
 /**
@@ -180,40 +203,130 @@ async function update(poolId, userId, fields) {
 }
 
 /**
- * Submit the pooled contribution as a single large contribution from the leader.
- * Marks pool as 'submitted', creates a contribution with all member shares tracked.
+ * Submit the pooled contribution as a single Stellar payment from the leader.
+ *
+ * Two phases:
+ *  1. Under a row lock, validate and atomically claim the pool by moving it
+ *     to 'submitting' — this is the guard against a double-submit race, and
+ *     it happens before any (slow, external) Stellar call.
+ *  2. Outside the transaction, resolve the leader's wallet and submit via the
+ *     same `submitCustodialContribution` used by the main contribution route.
+ *     On success the pool becomes 'submitted' and every confirmed member is
+ *     stamped `contributed_at`. On any failure the pool is rolled back to its
+ *     pre-claim status so it can be retried — it is never left 'submitting'
+ *     or marked 'submitted' for a payment that didn't actually go through.
+ *
+ * Scope note (#804): only a custodial leader wallet is supported for now — a
+ * Freighter leader gets a clear 422 rather than a half-built signing flow.
  */
 async function submitPool(poolId, userId) {
-  const pool = await db.query(
-    `SELECT * FROM contribution_pools WHERE id = $1`,
-    [poolId]
-  );
-  if (pool.rows.length === 0) throw new Error('Pool not found');
-  if (pool.rows[0].leader_id !== userId) throw new Error('Only the pool leader can submit');
-  if (pool.rows[0].status !== 'open') throw new Error('Pool is not open');
+  const client = await db.connect();
+  let priorStatus;
+  let members;
+  let totalAmount;
+  let campaignId;
+  try {
+    await client.query('BEGIN');
 
-  // Get confirmed members
-  const { rows: members } = await db.query(
-    `SELECT * FROM pool_members WHERE pool_id = $1 AND status = 'confirmed'`,
-    [poolId]
-  );
-  if (members.length === 0) throw new Error('No confirmed members in the pool');
+    const { rows: poolRows } = await client.query(
+      `SELECT * FROM contribution_pools WHERE id = $1 FOR UPDATE`,
+      [poolId]
+    );
+    if (poolRows.length === 0) throw poolError('Pool not found', 404);
+    const pool = poolRows[0];
+    if (pool.leader_id !== userId) throw poolError('Only the pool leader can submit', 403);
+    if (!['open', 'closed'].includes(pool.status)) {
+      throw poolError('Pool is not open', 409);
+    }
 
-  const totalAmount = members.reduce((sum, m) => sum + parseFloat(m.share_amount), 0);
-  if (totalAmount <= 0) throw new Error('Total pool amount must be positive');
+    const { rows: memberRows } = await client.query(
+      `SELECT * FROM pool_members WHERE pool_id = $1 AND status = 'confirmed'`,
+      [poolId]
+    );
+    if (memberRows.length === 0) throw poolError('No confirmed members in the pool', 400);
 
-  // Update pool status
-  await db.query(
-    `UPDATE contribution_pools SET status = 'submitted', raised_amount = $1, updated_at = NOW() WHERE id = $2`,
-    [totalAmount, poolId]
-  );
+    const total = memberRows.reduce((sum, m) => sum + parseFloat(m.share_amount), 0);
+    if (total <= 0) throw poolError('Total pool amount must be positive', 400);
 
-  return {
-    pool_id: poolId,
-    total_amount: totalAmount,
-    member_count: members.length,
-    message: 'Pool submitted. Contribution will be processed as a single payment.',
-  };
+    await client.query(
+      `UPDATE contribution_pools SET status = 'submitting', updated_at = NOW() WHERE id = $1`,
+      [poolId]
+    );
+    await client.query('COMMIT');
+
+    priorStatus = pool.status;
+    members = memberRows;
+    totalAmount = total;
+    campaignId = pool.campaign_id;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  try {
+    const { rows: leaderRows } = await db.query(
+      'SELECT wallet_public_key, wallet_secret_encrypted, wallet_type FROM users WHERE id = $1',
+      [userId]
+    );
+    const leader = leaderRows[0];
+    if (!leader || leader.wallet_type !== 'custodial') {
+      throw poolError('Pool submission currently requires a custodial wallet for the leader', 422);
+    }
+
+    const { rows: campaignRows } = await db.query(
+      'SELECT id, title, asset_type, wallet_public_key, escrow_contract_id, status FROM campaigns WHERE id = $1',
+      [campaignId]
+    );
+    const campaign = campaignRows[0];
+    if (!campaign || campaign.status !== 'active') {
+      throw poolError('Campaign is not active', 400);
+    }
+
+    const result = await submitCustodialContribution({
+      campaign,
+      campaignId: campaign.id,
+      userId,
+      walletPublicKey: leader.wallet_public_key,
+      walletSecretEncrypted: leader.wallet_secret_encrypted,
+      amount: totalAmount,
+      sendAsset: campaign.asset_type,
+      displayName: 'Pool contribution',
+    });
+
+    const finalizeClient = await db.connect();
+    try {
+      await finalizeClient.query('BEGIN');
+      await finalizeClient.query(
+        `UPDATE contribution_pools SET status = 'submitted', raised_amount = $1, tx_hash = $2, updated_at = NOW() WHERE id = $3`,
+        [totalAmount, result.txHash, poolId]
+      );
+      await finalizeClient.query(
+        `UPDATE pool_members SET contributed_at = NOW() WHERE pool_id = $1 AND status = 'confirmed'`,
+        [poolId]
+      );
+      await finalizeClient.query('COMMIT');
+    } catch (err) {
+      await finalizeClient.query('ROLLBACK');
+      throw err;
+    } finally {
+      finalizeClient.release();
+    }
+
+    return {
+      pool_id: poolId,
+      total_amount: totalAmount,
+      member_count: members.length,
+      tx_hash: result.txHash,
+    };
+  } catch (err) {
+    await db.query(
+      `UPDATE contribution_pools SET status = $1, updated_at = NOW() WHERE id = $2 AND status = 'submitting'`,
+      [priorStatus, poolId]
+    );
+    throw err;
+  }
 }
 
 module.exports = {

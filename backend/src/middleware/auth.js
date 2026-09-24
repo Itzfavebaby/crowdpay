@@ -164,7 +164,8 @@ function isImpersonatedRestrictedAction(req) {
     path.startsWith('/api/withdrawals') ||
     path.startsWith('/api/contributions') ||
     path.startsWith('/api/anchor') ||
-    path.startsWith('/api/wallets')
+    path.startsWith('/api/wallets') ||
+    path.startsWith('/api/governance')
   ) {
     return true;
   }

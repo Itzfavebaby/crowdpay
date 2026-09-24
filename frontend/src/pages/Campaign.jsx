@@ -184,6 +184,7 @@ import { isConnected, getPublicKey } from '@stellar/freighter-api';
 const BackerInsightsCard = React.lazy(() => import('../components/BackerInsightsCard'));
 import CampaignComments from '../components/CampaignComments';
 import FollowCampaignButton from '../components/FollowCampaignButton';
+import PoolManager from '../components/PoolManager';
 import LanguageToggle from '../components/LanguageToggle';
 import { addRecentlyViewed } from '../lib/recentlyViewed';
 
@@ -1624,6 +1625,12 @@ export default function Campaign() {
             asset={campaign.asset_type}
             onSubscribed={() => setContributed((prev) => !prev)}
           />
+        )}
+
+        {campaign.status === 'active' && (
+          <div style={{ marginTop: '1.5rem' }}>
+            <PoolManager campaignId={id} campaignTitle={campaign.title} />
+          </div>
         )}
 
         {user && (
